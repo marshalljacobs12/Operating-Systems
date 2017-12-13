@@ -1,0 +1,374 @@
+       	       	     +-------------------------+
+		     |		CS 140	       |
+		     | PROJECT 4: FILE SYSTEMS |
+		     |	   DESIGN DOCUMENT     |
+		     +-------------------------+
+
+---- GROUP ----
+
+>> Fill in the names and email addresses of your group members.
+
+Marshall Jacobs <mjjacobs@usc.edu>
+
+---- PRELIMINARIES ----
+
+>> If you have any preliminary comments on your submission, notes for the
+>> TAs, or extra credit, please give them here.
+
+I asked Professor Redekopp during office hours about how to answer the 
+synchronization questions (A3, A4, A5, B4) given that we didn't need to 
+implement fine-grained locking in this project, and he said that I could 
+essentially just say "I have a big file system lock" and elaborate briefly.
+Therefore, my answers for the synchronization questions are brief and somewhat
+redundant.
+
+Implemented project 4 on top of project 3, so I should receive the extra credit
+for doing so. Did not implement buffer cache because we were not required to do
+so.
+
+>> Please cite any offline or online sources you consulted while
+>> preparing your submission, other than the Pintos documentation, course
+>> text, lecture notes, and course staff.
+
+CITE: Stanford Pintos Documentation
+CITE: Pintos Guide PDF - Stephen Tsung-Han Sher
+CITE: project4.pdf
+
+		     INDEXED AND EXTENSIBLE FILES
+		     ============================
+
+---- DATA STRUCTURES ----
+
+>> A1: Copy here the declaration of each new or changed `struct' or
+>> `struct' member, global or static variable, `typedef', or
+>> enumeration.  Identify the purpose of each in 25 words or less.
+
+inode.c
+
+#define NUM_BLOCKS 12: NUM_BLOCKS is used to store the size of the blocks array
+which has 10 direct, 1 indirect, and 1 double indirect block.
+
+#define NUM_DIRECT_BLOCKS 10: NUM_DIRECT_BLOCKS is used to store the number of 
+direct blocks in the blocks array.
+
+#define NUM_DIRECT_PTRS 128: NUM_DIRECT_PTRS is the number of direct blocks 
+contained in an indirect block.
+
+#define NUM_INDIRECT_PTRS 128: NUM_INDIRECT_PTRS is the number of indirect 
+blocks contained in a double indirect block.
+
+#define INDIRECT_BLOCK_INDEX 10: INDIRECT_BLOCK_INDEX is the index in the 
+blocks array at which the indirect block' sector is stored.
+
+#define DOUBLE_INDIRECT_BLOCK_INDEX 11: DOUBLE_INDIRECT_BLOCK_INDEX is the 
+index in the blocks array at which the double indirect block's sector is 
+stored.
+
+#define DIRECT_BLOCK_LIMIT (NUM_DIRECT_BLOCKS * BLOCK_SECTOR_SIZE): Positions
+in an inode less than DIRECT_BLOCK_LIMIT are contained in one of the direct
+blocks.
+
+#define INDIRECT_BLOCK_LIMIT (DIRECT_BLOCK_LIMIT + (NUM_DIRECT_PTRS * BLOCK_SECTOR_SIZE)): Positions in an inode greater than DIRECT_BLOCK_LIMIT and
+less than INDIRECT_BLOCK_LIMIT are contained in the indirect block. 
+
+#define MAX_FILE_SIZE 1<<23: MAX_FILE_SIZE is the maximum file size which is 
+8Mb = 2^23
+
+#define EXTEND_ERROR -1: If inode_extend returns EXTEND_ERROR, then there was a
+problem extending the file.
+
+#define EXTEND_COMPLETE 0: If inode_extend_indirect or 
+inode_extend_double_indirect returns EXTEND_COMPLETE, then inode_extend can 
+return new inode length.  
+
+/* On-disk inode. Must be exactly BLOCK_SECTOR_SIZE bytes long. */
+struct inode_disk
+{
+  block_sector_t blocks[NUM_BLOCKS];  /* 12 blocks (10 direct, 1 indirect, 
+                                         1 double indirect per inode_disk) */
+  block_sector_t sector;              /* sector number of inode_disk location */
+  block_sector_t parent;              /* sector number of inode_disk's parent */
+  off_t length;                       /* File size in bytes. */
+  bool is_dir;						  /* true if the file is a directory */
+  unsigned magic;                     /* Magic number. */
+  uint32_t unused[111];               /* I use 68 bytes of memory for
+  										 inode_disk's members, so I need 111
+  										 unused 4 byte chunks to use all 512
+  										 bytes of sector */
+}
+
+struct inode_disk: inode_disk stores metadata about a file on disk in a sector.
+It is persistent, so when information about a file is needed, inode_disk is 
+deserialized.
+
+static char zero_block[BLOCK_SECTOR_SIZE]: When a block is allocated, it is
+initially written to disk with 512 zeros using zero_block. 
+
+struct inode 
+{
+  struct list_elem elem;              /* Element in inode list. */
+  int open_cnt;                       /* Number of openers. */
+  bool removed;                       /* True if deleted, false otherwise. */
+  int deny_write_cnt;                 /* 0: writes ok, >0: deny writes. */
+  struct inode_disk data;             /* actual on-disk inode with persistent
+  										 file metadata */
+};
+
+struct inode: inode is an in-memory wrapper for inode_disk. It stores 
+additional metadata that doesn't need to be persistent as well as the 
+inode_disk itself.
+
+>> A2: What is the maximum size of a file supported by your inode
+>> structure?  Show your work.
+
+The maximum size of a file supported by my inode structure would use all 10 
+sectors pointed at by my direct blocks, all 128 sectors pointed at by the
+128 direct blocks in my indirect block, and all 128 * 128 sectors pointed at by
+the 128 indirect blocks in my doubly indirect block (where each indirect block
+points at 128 direct blocks, each of which points at a sector). Therefore, the
+max file size I support is calculated as follows:
+
+Max file size = 10 direct blocks + 1 indirect block + 1 double indirect block
+Max file size = 10 * 512 bytes + 128 * 512 bytes + 128 * 128 * 512 bytes
+Max file size = 5,120 bytes + 65,536 bytes + 8,388,608 bytes
+Max file size = 8,459,264 bytes
+
+I can assume in project 4 that the file system partition will be no larger than
+8 MB, meaning that no file will be larger than 8 MB. 
+
+8 MB = 8,388,608 bytes < 8,459,264 bytes = Max file size I support
+
+So I adequately support any potential file required in project 4. 
+
+---- SYNCHRONIZATION ----
+
+>> A3: Explain how your code avoids a race if two processes attempt to
+>> extend a file at the same time.
+
+Two processes cannot extend a file at the same time because my filesys_lock 
+locks the entire file system, preventing concurrent modifications of any file.
+The three syscalls that could extend a file are create, write, and mkdir. 
+However, none of them can call the underlying filesys_create or file_write 
+without first having acquired the filesys_lock. 
+
+>> A4: Suppose processes A and B both have file F open, both
+>> positioned at end-of-file.  If A reads and B writes F at the same
+>> time, A may read all, part, or none of what B writes.  However, A
+>> may not read data other than what B writes, e.g. if B writes
+>> nonzero data, A is not allowed to see all zeros.  Explain how your
+>> code avoids this race.
+
+Similar to the above reasoning, two processes cannot call file_write at the 
+same time because a process must first acquire filesys_lock.
+
+>> A5: Explain how your synchronization design provides "fairness".
+>> File access is "fair" if readers cannot indefinitely block writers
+>> or vice versa.  That is, many processes reading from a file cannot
+>> prevent forever another process from writing the file, and many
+>> processes writing to a file cannot prevent another process forever
+>> from reading the file.
+
+My synchronization gives no preference to either writers or readers. Before a
+process can call file_read or file_write, it must first acquire the 
+filesys_lock. The process that gets to acquire the filesys_lock when it is 
+released is simply the first waiter in the waiters list which makes no 
+distinction between readers and writers.
+
+---- RATIONALE ----
+
+>> A6: Is your inode structure a multilevel index?  If so, why did you
+>> choose this particular combination of direct, indirect, and doubly
+>> indirect blocks?  If not, why did you choose an alternative inode
+>> structure, and what advantages and disadvantages does your
+>> structure have, compared to a multilevel index?
+
+Yes. I chose to have 10 direct block, 1 indirect block, and 1 doubly indirect
+block because it provided enough sectors to store an 8MB file, which was the 
+largest possible file size that project 4 required I support. I credit Stephen
+Sher's Pintos guide for doing that math for me (at the bottom of page 69 he
+suggests 12 entries in inode_disk's blocks array with the above number of 
+direct, indirect, and doubly indirect blocks so as to support up to 8MB files).
+To support 8MB files, the fixed-depth asymmetric tree required a single doubly-
+indirect block because 512 * 128 * 128 = 2^9 * 2^7 * 2^7 = 2^23 = 8MB. One
+could not fit enough indirect blocks in an inode_disk to store an 8MB file.
+The maximum number of indirect blocks would be 492/4 = 123 because the 
+inode_disk struct still requires the magic, length, sector, parent, and is_dir
+members. 123*128*512 = 8,060,928 bytes which is less than 8,388,608 bytes = 
+8MB. 
+
+			    SUBDIRECTORIES
+			    ==============
+
+---- DATA STRUCTURES ----
+
+>> B1: Copy here the declaration of each new or changed `struct' or
+>> `struct' member, global or static variable, `typedef', or
+>> enumeration.  Identify the purpose of each in 25 words or less.
+
+in thread.h's thread struct
+
+struct dir *cwd: cwd stores a process's current working directory. It is 
+initially set to NULL unless it is the child process of an exec syscall.
+
+in syscall.h
+struct process_file
+{
+  struct file* file;
+  struct dir* dir;					  /* dir stores the open directory 
+  										 represented by this process_file if it
+  										 is a directory. NULL otherwise. */
+  int fd;
+  bool is_executable;
+  bool is_dir;						  /* is_dir is true if the process_file is 
+  										 a directory or false if the 
+  										 process_file is a normal file */
+  struct list_elem elem;
+};
+
+struct process_file: A process_file maps an open file or directory to its file
+descriptor. Each user process keeps a list of open files/directories.
+
+---- ALGORITHMS ----
+
+>> B2: Describe your code for traversing a user-specified path.  How
+>> do traversals of absolute and relative paths differ?
+
+I have two functions that perform the traversals of user-specified paths, 
+parse_path_for_directory and parse_path_for_filename in filesys.c. 
+parse_path_for_filename takes the entire path and finds the name of the file
+without any of the preceding part of the path. For example, to open file "c", 
+with path "a/b/c", parse_path_filename will return "c". This is achieved by 
+calling strtok_r repeatedly using "/" as the delimter.
+parse_path_for_directory opens the parent directory of "c" by parsing in a 
+similar fashion and opening and opening a directory during each iteration of
+strtok_r, but stops one token before parse_path_for_filename. It also accounts
+for special characters "." and "..". parse_path_for_filename works identically 
+for absolute and relative paths. parse_path_for_directory works slightly 
+differently for absolute and relative paths if the current working directory 
+of the process is not the root. In the case that the current working directory 
+is not the root, an absolute path will first open the root directory. On the 
+other hand, a relative path will first open the current working directory. If
+the current working directory of the process is the root directory, 
+parse_path_for_directory works the same for absolute and relative paths. 
+
+---- SYNCHRONIZATION ----
+
+>> B4: How do you prevent races on directory entries?  For example,
+>> only one of two simultaneous attempts to remove a single file
+>> should succeed, as should only one of two simultaneous attempts to
+>> create a file with the same name, and so on.
+
+Again, there can only be one process reading/writing/opening/removing/etc... 
+a file or directory in the file system at one time. Before any file.c,
+filesystem.c or directory.c function is called, the process must first 
+acquire the filesys_lock. Therefore, the race described above cannot happen
+because there cannot be two concurrent calls to filesys_create. 
+
+>> B5: Does your implementation allow a directory to be removed if it
+>> is open by a process or if it is in use as a process's current
+>> working directory?  If so, what happens to that process's future
+>> file system operations?  If not, how do you prevent it?
+
+No. I disallow removing directories that are in use by other processes. I also
+disallow removing a directory that is in use as a process's current working 
+directory. When a directory is opened via filesys_open, there are 3 cases. If 
+the last part of path is "..", then the parent of the directory returned by 
+parse_path_for_directory is opened, settings its open_cnt to 1. If the last 
+part of path is ".", then parse_path_for_directory will set the directory's 
+inode to have an  open_cnt of 1. Finally, if neither of these criteria are 
+satisfied, the else inside the if (dir != NULL) block calls dir_lookup 
+(filesys.c lines 110-117) which calls inode_open, again setting the open_cnt
+to 1. If this process or a different process wants to have the directory in 
+question be its current working directory, it must call chdir. filesys_chdir 
+undergoes similar checks as described in filesys_create, so by the end of 
+chdir, the process's current working directory will have an open_cnt =2. 
+Similarly, calling filesys_open repeatedly increments open_cnt by 1 each time. 
+In either situation, I prevent this directory from being removed by 
+disallowing removing directories whose inodes have an open_cnt > 1 in 
+dir_remove (directory.c lines 218-219).
+
+
+---- RATIONALE ----
+
+>> B6: Explain why you chose to represent the current directory of a
+>> process the way you did.
+
+I chose to represent the current working directory of a process by adding a 
+member to the thread struct cwd, which was a struct dir*. I chose to do it this
+way because it was the logical place to put it, and made implementing various
+parts of the project simple. First, I chose to place it inside USERPROG 
+conditional group so that it would only be a member of the thread if the 
+USERPROG macro was defined, meaning that it would only be a member of threads 
+that were user processes. The project only defines a current working directory
+for user processes, so putting it in this part of the thread struct made the 
+most sense. I made cwd's default initial value NULL. When a thread is created,
+the only situation where the newly created thread would have a non-NULL cwd is 
+if exec was called and the parent process had a non-NULL cwd. This can be seen 
+in thread.c line 206-214. Having the initial value of a process's current 
+working directory  be NULL is properly accounted for in system calls. In
+filesys.c, when a file is created, opened, or removed, if a process has a NULL
+current working directory, parse_path_for_directory will open the root
+directory (filesys.c lines 185-188) so that the file system structure is 
+properly maintained. For a chdir syscall, filesys_chdir will close the 
+process's current working directory, and then update it to the directory 
+specified by the path passed in the chdir syscall (filesys.c lines 305/306).
+Calling dir_close with a NULL directory has no side effects, so again, having
+the initial value as NULL seemed like the easiest way to accomplish all current
+-working-directory-related functionality.
+
+
+			     BUFFER CACHE
+			     ============
+
+---- DATA STRUCTURES ----
+
+>> C1: Copy here the declaration of each new or changed `struct' or
+>> `struct' member, global or static variable, `typedef', or
+>> enumeration.  Identify the purpose of each in 25 words or less.
+
+---- ALGORITHMS ----
+
+>> C2: Describe how your cache replacement algorithm chooses a cache
+>> block to evict.
+
+>> C3: Describe your implementation of write-behind.
+
+>> C4: Describe your implementation of read-ahead.
+
+---- SYNCHRONIZATION ----
+
+>> C5: When one process is actively reading or writing data in a
+>> buffer cache block, how are other processes prevented from evicting
+>> that block?
+
+>> C6: During the eviction of a block from the cache, how are other
+>> processes prevented from attempting to access the block?
+
+---- RATIONALE ----
+
+>> C7: Describe a file workload likely to benefit from buffer caching,
+>> and workloads likely to benefit from read-ahead and write-behind.
+
+			   SURVEY QUESTIONS
+			   ================
+
+Answering these questions is optional, but it will help us improve the
+course in future quarters.  Feel free to tell us anything you
+want--these questions are just to spur your thoughts.  You may also
+choose to respond anonymously in the course evaluations at the end of
+the quarter.
+
+>> In your opinion, was this assignment, or any one of the three problems
+>> in it, too easy or too hard?  Did it take too long or too little time?
+
+>> Did you find that working on a particular part of the assignment gave
+>> you greater insight into some aspect of OS design?
+
+>> Is there some particular fact or hint we should give students in
+>> future quarters to help them solve the problems?  Conversely, did you
+>> find any of our guidance to be misleading?
+
+>> Do you have any suggestions for the TAs to more effectively assist
+>> students in future quarters?
+
+>> Any other comments?

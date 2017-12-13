@@ -1,0 +1,312 @@
+		     +--------------------------+
+       	     |		     CS 140		    |
+		     | PROJECT 2: USER PROGRAMS	|
+		     | 	   DESIGN DOCUMENT     	|
+		     +--------------------------+
+
+---- GROUP ----
+
+>> Fill in the names and email addresses of your group members.
+
+Marshall Jacobs <mjjacobs@usc.edu>
+
+---- PRELIMINARIES ----
+
+>> If you have any preliminary comments on your submission, notes for the
+>> TAs, or extra credit, please give them here.
+
+>> Please cite any offline or online sources you consulted while
+>> preparing your submission, other than the Pintos documentation, course
+>> text, lecture notes, and course staff.
+
+CITE: Stanford Pintos Documentation
+CITE: Pintos Guide PDF - Stephen Tsung-Han Sher
+CITE: Project2.pdf
+CITE: CS350_Project2.pdf - Masoud Moshref
+CITE: Office hours with Abdulla and Professor Redekopp
+
+			   ARGUMENT PASSING
+			   ================
+
+---- DATA STRUCTURES ----
+
+>> A1: Copy here the declaration of each new or changed `struct' or
+>> `struct' member, global or static variable, `typedef', or
+>> enumeration.  Identify the purpose of each in 25 words or less.
+
+NONE
+
+---- ALGORITHMS ----
+
+>> A2: Briefly describe how you implemented argument parsing.  How do
+>> you arrange for the elements of argv[] to be in the right order?
+>> How do you avoid overflowing the stack page?
+
+I parse arguments in the following way:
+  1. I find argc.
+  2. I find the char arrays that are the strings of the arguments and put them in args
+  3. I allocate argv which is argc+1 in size (last entry is 0)
+  4. Then, I begin pushing arguments. I push the string args in reverse order (last argument first, executable argument last) to ensure correct ordering. I copy over the length of an arg + 1 so as to include the null character. I also store the address of esp after each memcpy in argv[i] so I can push the argv char*s correctly
+  5. I align on a 4 byte boundary.
+  6. I push the argv[i]s in reverse order. argv[argc]=0
+  7. Finally i push argv, argc and a dummy return address (0).
+
+Overflowing the stack page would cause a page fault. In my page fault handler, I kill the thread, exiting with a exit status of -1.  
+
+---- RATIONALE ----
+
+>> A3: Why does Pintos implement strtok_r() but not strtok()?
+
+FROM THE MAN PAGE
+The strtok_r() function is a reentrant version strtok().  The saveptr argument is a pointer to a char * variable that is used internally by strtok_r() in order to maintain context between successive calls that parse the same string.
+       
+Different strings may be parsed concurrently using sequences of calls to strtok_r() that specify different saveptr arguments.
+
+By having each thread pass a save_ptr, strings won't get corrupted when being parsed. save_ptr also allows the thread to access the arguments when setting up the stack after the call to strtok_r. 
+
+>> A4: In Pintos, the kernel separates commands into a executable name
+>> and arguments.  In Unix-like systems, the shell does this
+>> separation.  Identify at least two advantages of the Unix approach.
+
+1. It is safer to do it the Unix way. If there are invalid pointers, user process (shell) will crash and kernel will not be corrupted.
+
+2. It allows the shell to check if valid pointers point to invalid data (i.e. to determine what is the executable name vs the arguments passed to the executable and if they are valid arguments). 
+
+			     SYSTEM CALLS
+			     ============
+
+---- DATA STRUCTURES ----
+
+>> B1: Copy here the declaration of each new or changed `struct' or
+>> `struct' member, global or static variable, `typedef', or
+>> enumeration.  Identify the purpose of each in 25 words or less.
+
+thread.h
+
+enum load_stage
+{
+  NOT_STARTED,
+  LOAD_FAILURE,
+  LOAD_SUCCESS,
+};
+
+load_stage is used to ensure that an executable is fully loads during an exec system call before the caller continues.
+
+typedef int pid_t: pid_t is the process ID of an user process (typedef'd as an int). 
+
+#ifdef USERPROG
+pid_t pid: the process id of this user program 
+
+struct thread *parent: the parent of this user program. Used for exec, exit, and wait system calls. 
+
+enum load_stage load_status: the load_stage of this user process.   
+
+struct lock child_wait_lock: child_wait_lock lock is used to ensure proper synchronization in exec, wait, and exit system calls.  
+
+struct condition child_exited: child_exited condition variable is used to ensure proper synchronization in wait and exit system calls. 
+
+struct list child_processes: child_processes maintains a list of child_processes of the user process. Used in process_wait to ensure a parent process waits on a child process to finish.
+
+struct list open_files: open_files maintains a list of process_files that the current process has open. Used in open, filesize, read, write, seek, tell, and close system calls.
+
+int fd_count: fd_count ensures that each process has a unique file descriptor for each of its open files. 
+
+struct file* exec: exec tracks the executable file that this user process is currently loading / running. Closes this file during process_exit.
+
+struct condition child_loaded: child_loaded condition variable is used to ensure proper synchronization in exec system call. 
+
+#endif
+
+process.h
+
+#define DEFAULT_EXIT_STATUS INT32_MIN: DEFAULT_EXIT_STATUS is the initial exit status of a child_process. When a child_process exits, its child_exit_status is updated and the parent process can wakeup in process_wait.
+
+struct child_process
+{
+  pid_t child_process_pid;
+  enum load_stage load_status;
+  int child_exit_status;
+  bool parent_has_called_wait;
+  bool kernel_terminated_child;
+  struct list_elem elem;
+};
+
+child_process: Each user process has a list of child_processes. A child_process maintains information that its parent process needs to properly implement process_wait.
+
+syscall.h
+
+struct process_file
+{
+  struct file* file;
+  int fd;
+  bool is_executable;
+  struct list_elem elem;
+};
+
+process_file: A process_file maps an open file to its file descriptor. Each user process keeps a list of open files.
+
+syscall.c
+
+#define CODE_SEGMENT_ADDR (void*) 0x08048000: The address in Pintos where the user program code is stored. CODE_SEGMENT_ADDR is used to check that pointers have valid addresses. 
+
+static struct lock filesys_lock: filesys_lock is used for syscalls to ensure that only one thread is accessing the file system at a time. 
+
+>> B2: Describe how file descriptors are associated with open files.
+>> Are file descriptors unique within the entire OS or just within a
+>> single process?
+
+File descriptors are associated with open files via the struct process_file, and this association occurs during calls to the open system call. File descriptors are only unique within a single process, but not within the entire OS. Each process has a fd_count member which is initialized to 2. When a process opens its first file, that process_file's file descriptor is set to 2 and fd_count is incremented by 1. Thus, each open file within a process will have a unique file descriptor, but each process's first open file will have the file descriptor 2, so a file descriptor is not unique across all process's in the entire operating system.   
+
+---- ALGORITHMS ----
+
+>> B3: Describe your code for reading and writing user data from the
+>> kernel.
+
+Read
+
+First, I check pointers (including every pointer in the buffer) and cast 
+arguments. If any of these checks fail, exit with status code -1.
+
+Then, I check whether it's keyboard or file based off file descriptor 
+parameter.
+  
+If it is keyboard input, then read in each character from the keyboard to 
+the buffer using input_getc and return the number of bytes read in (size).
+  
+If the file descriptor is not STDIN_FILENO, then it describes a file in the 
+file system. To read from the file with this file descriptor, first acquire the filesystem lock. Then, try to find the file that matches this file descriptor in the current process's open_files list. If it cannot be found, then release the filesystem lock and return -1. If it is found, then call file_read on the file that corresponds to the file descriptor, release the filesystem lock and return the number of bytes read. 
+
+Write
+
+First, I check pointers (including every pointer in the buffer) and cast 
+arguments. If any of these checks fail, exit with status code -1.
+
+Then, I check whether it's the console file descriptor or a file in the 
+filesystem.
+
+If it's a write to the console, then write size bytes to the console by 
+calling put_buf.
+
+If the file descriptor is not STDOUT_FILENO, then it describes a file in the 
+file system. To write to a file with this file descriptor, first acquire the filesystem lock. Then, try to find the file that matches this file descriptor in the current process's open_files list. If it cannot be found, then release the filesystem lock and return -1. If it is found, then call file_write on the file that corresponds to the file descriptor, release the filesystem lock and return the number of bytes written.
+
+>> B4: Suppose a system call causes a full page (4,096 bytes) of data
+>> to be copied from user space into the kernel.  What is the least
+>> and the greatest possible number of inspections of the page table
+>> (e.g. calls to pagedir_get_page()) that might result?  What about
+>> for a system call that only copies 2 bytes of data?  Is there room
+>> for improvement in these numbers, and how much?
+
+Inspecting the page table occurs during calls to check_ptr (which can be called by parse_args).
+
+The least number of inspections of the page table when loading a full page would be 1. This could occur for the system call halt where it just needs to check the stack pointer even if it loads in a full page (4096 bytes). The greatest number of inspections of the page table would be 4096. This could occur for the system call read where a large buffer is passed as a parameter. In my implementation of the read system call, I check each pointer in the buffer. 
+
+The least number of inspections for a system call that copies 2 bytes of data is 1 inspection if those 2 bytes are part of the same page. If the two bytes fell on the boundary of 2 pages it could require 2 inspections. 
+
+I could improve my implementation of the first case (where 4096 bytes are loaded) and reduce the number of inspections to 2. 4096 bytes of contiguous virtual addresses can fall on at most 2 pages, so that would require at most 2 inspections. 
+
+>> B5: Briefly describe your implementation of the "wait" system call
+>> and how it interacts with process termination.
+
+The wait system call is implemented in the process_wait function. To assist with the wait system call, I add several data structures and members to the thread struct. The child_process struct contains the child process's pid and exit status, along with boolean flags for whether the kernel has terminated this process and whether the process's parent has already called wait. In the thread struct, each thread has a pointer to it's parent, a list of child process's and a lock and condition variable to enable the parent to wait on it's child process to finish executing.
+
+In process_wait, the parent process acquires child_wait_lock and waits for the child process to have an exit status that is not DEFAULT_EXIT_STATUS. After waiting, the parent checks if the child process's parent has already called wait. If it has, then it returns -1. Otherwise, it sets the child process's parent_has_called_wait flag to true and sets its exit status. In either case, it frees the child process from the child_processes list to correctly manage resources. Finally, it releases its child_wait_lock and returns the exit status.
+
+Process termination happens via the exit system call. When exiting a process, if the exiting process has a parent (checked by is_thread_in_all_list), then the child process in the parent's child_processes list updates its kernel_terminated_child flag and child_exit_status. Finally, it calls thread_exit which calls process_exit. In process_exit, if that process has a parent process (checked by is_thread_in_all_list), then it signals that parent that it's child process has exited so the parent can wake up in process_wait. 
+
+>> B6: Any access to user program memory at a user-specified address
+>> can fail due to a bad pointer value.  Such accesses must cause the
+>> process to be terminated.  System calls are fraught with such
+>> accesses, e.g. a "write" system call requires reading the system
+>> call number from the user stack, then each of the call's three
+>> arguments, then an arbitrary amount of user memory, and any of
+>> these can fail at any point.  This poses a design and
+>> error-handling problem: how do you best avoid obscuring the primary
+>> function of code in a morass of error-handling?  Furthermore, when
+>> an error is detected, how do you ensure that all temporarily
+>> allocated resources (locks, buffers, etc.) are freed?  In a few
+>> paragraphs, describe the strategy or strategies you adopted for
+>> managing these issues.  Give an example.
+
+To avoid obfuscating the primary function of a system call, all the pointer checking is handled via calls to check_ptr. For system calls that pass multiple arguments, the parse_args function checks all the pointers required for that system call which further prevents obscuring the primary function of those system calls. Furthermore, all system calls have wrappers that are primarily concerned with validating pointers and casting arguments. These wrapper functions call the system call functions with the signatures prescribed by the Stanford Pintos guide. If any of the checks in parse_args fails in the wrapper function, then the system call calls exit(-1), which will free all the process's resources (i.e. the members of its child_processes list) in process_exit. If a bad pointer occurs in an the inner system call (the function the wrapper calls), then it will first release the filesystem lock before returning.
+
+To illustrate this, consider a call to the write system call. In syscall_write, if any of the pointers are bad arguments, the if(parse_args(f,3)) statement evaluates to false, so syscall_write then calls exit(-1). If parse_args doesn't fail, then it will cast arguments and check the buffer. If a pointer in the buffer is invalid, then if(valid_buffer) won't evaluate to true, so syscall_write will call exit(-1). If the buffer has all valid pointers, it calls write(fd, buffer, size). In write, if the write is not to the console, the process acquires filesys_lock. If the file descriptor passed to write doesn't match any of the file descriptor's in that process's open_files list, then write first releases filesys_lock before returning to ensure that all resources are freed. If the file descriptor argument is valid, then write is called, the filesys_lock is released, and write returns the number of bytes written.
+
+---- SYNCHRONIZATION ----
+
+>> B7: The "exec" system call returns -1 if loading the new executable
+>> fails, so it cannot return before the new executable has completed
+>> loading.  How does your code ensure this?  How is the load
+>> success/failure status passed back to the thread that calls "exec"?
+
+The enum load_stage, the lock child_wait_lock, and the condition variable child_loaded ensures that the new executable has completed loading.
+
+The exec system call calls process_execute. process_execute calls thread_create passing start_process as the thread_func. thread_create will initially set load_status to NOT_STARTED. start_process calls load, which returns a boolean success which indicates whether the load was successful or not. process_execute needs to wait on the result of load, so it uses the child_wait_lock and child_loaded condition variable to wait until load_status is not NOT_STARTED. In start_process, if success evaluates to false, load_status is set to LOAD_FAILURE, and child_loaded signals so the process calling process_execute so it can proceed and return -1. In start_process, if success evaluates to true, load_status is set to LOAD_SUCCESS, and child_loaded signals so the process calling process_execute can proceed and return the new process's tid.
+
+>> B8: Consider parent process P with child process C.  How do you
+>> ensure proper synchronization and avoid race conditions when P
+>> calls wait(C) before C exits?  After C exits?  How do you ensure
+>> that all resources are freed in each case?  How about when P
+>> terminates without waiting, before C exits?  After C exits?  Are
+>> there any special cases?
+
+4 cases:
+
+P calls wait(C) before C exits
+
+When P calls process_wait, P acquires child_wait_lock and waits for C to have an exit status that is not DEFAULT_EXIT_STATUS. When C exits, P's child_process that corresponds to C updates its exit status, frees C's child_processes list, and signals P to wake up. When P wakes up in process_wait, it removes C's child_process struct from P's child_processes and frees that memory. Finally, it releases child_wait_lock and returns C's exit status.  
+
+P calls wait after C exits
+
+When C exits, P's child_process that corresponds to C updates its exit status and frees C's resources. When P calls process_wait, P acquires child_wait_lock but does not have to wait on the C to exit. Then, P removes C's child_process struct from P's child_processes list and frees that memory. Finally, it releases child_wait_lock and returns C's exit status.
+
+P terminates without waiting before C exits
+
+When P terminates, it calls process_exit. In process_exit, P clears its child_processes list and frees that memory. Then P clears all the files in its open_files list and frees that memory. Because P doesn't wait, it will not need to signal anyone. 
+
+P terminates without waiting after C exits.
+
+When C exits, it will acquire its P's child_wait_lock, signal with P's child_exited variable, and release P's child_wait_lock. This won't matter to P because P doesn't wait on C. When P terminates, it calls process_exit. In process_exit, P clears its child_processes list and frees that memory. Then P clears all the files in its open_files list and frees that memory. Because P doesn't wait, it will not need to signal anyone. 
+
+---- RATIONALE ----
+
+>> B9: Why did you choose to implement access to user memory from the
+>> kernel in the way that you did?
+
+Masoud Moshref's guide CS350_Project2.pdf slide 12 detailed two ways to 2 ways to validate virtual memory were 1. check the mapping using the methods provided in pagedir.c or 2. let pagefaults happen. I chose to go with method 1 because the API was already provided, so it seemed simpler. In project2.pdf, it gave the different criteria to check pointers on slide 17, so I used those checks in check_ptr. 
+
+>> B10: What advantages or disadvantages can you see to your design
+>> for file descriptors?
+
+My design for file descriptors was to make a struct process_file that associated a file with a file descriptor. Each process has a list of open_files which is just a bunch of process_files. The advantage of storing these process_files in a list was that I had used the list API before, so inserting into / deleting from and maintaining the list were rather simple. Because each thread has a list of open files, there is no limit to the number of open files a process can have as long as the thread takes less memory than the 4KB page it is stored in. 
+
+A disadvantage of storing the file descriptors in a list could occur if a process had many open files in its open_files list. Lookups in a list are O(n) which could be slow with a large number of files. Instead, the file descriptors could be stored in a hash map, which then would only take O(1) lookups. 
+
+>> B11: The default tid_t to pid_t mapping is the identity mapping.
+>> If you changed it, what advantages are there to your approach?
+
+There's not really a big advantage to changing the identity mapping from tid_t to pid_t in Pintos because each Pintos process can only have one thread. In a real operating system, a process could have multiple threads, so the identity mapping from tid_t to pid_t would no longer be viable because there could be multiple tids per pid. My approach just mapped a tid of 10 to a pid of 10, but there could be an alternative approach where tids were in a certain set of numbers (i.e. odd numbers) and pids were a different set of numbers (i.e. even numbers). They would still have equal size sets, maintaining the one-to-one mapping, but you could easily determine whether a thread was a kernel thread or user process simply by looking at its id.
+
+			   SURVEY QUESTIONS
+			   ================
+
+Answering these questions is optional, but it will help us improve the
+course in future quarters.  Feel free to tell us anything you
+want--these questions are just to spur your thoughts.  You may also
+choose to respond anonymously in the course evaluations at the end of
+the quarter.
+
+>> In your opinion, was this assignment, or any one of the three problems
+>> in it, too easy or too hard?  Did it take too long or too little time?
+
+>> Did you find that working on a particular part of the assignment gave
+>> you greater insight into some aspect of OS design?
+
+>> Is there some particular fact or hint we should give students in
+>> future quarters to help them solve the problems?  Conversely, did you
+>> find any of our guidance to be misleading?
+
+>> Do you have any suggestions for the TAs to more effectively assist
+>> students, either for future quarters or the remaining projects?
+
+>> Any other comments?
